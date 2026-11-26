@@ -2,7 +2,7 @@
 
 > 📖 完整的环境安装与使用说明（含 macOS 踩坑记录、Kibana 实操、AI 层三种接法）见
 > **[ELK-AI-环境安装与使用指南.md](./ELK-AI-环境安装与使用指南.md)**。
-> 本文是快速上手版，适合已经熟悉 Docker 的人。
+> 本文含**组件说明 + 安装步骤 + 六步实操**，零基础可跟；想深入原理的看上面那份。
 
 一套 30 分钟能跑通、覆盖「采集 → 存储 → 可视化 → AI 根因分析」全链路的练习环境。
 数据是造出来的（含两个故意埋的故障），不依赖任何真实业务系统。
@@ -16,6 +16,225 @@ elk-ai-demo/
 ├── ai_analyze.py            ES 出证据 + LLM 出 RCA 报告
 └── logstash/pipeline/       可选：练采集链路
 ```
+
+---
+
+## 组件地图：五个工具各管什么、怎么装
+
+先建立整体印象，再动手。这套 demo 用到的东西其实只有 5 个，每个职责都很清楚。
+
+### 一张表看完
+
+| 工具 | 一句话概念 | 在本 demo 中的作用 | 端口 | 必须吗 |
+|---|---|---|---|---|
+| **Docker Engine** | 容器运行时，把应用和依赖打包成镜像隔离运行 | 承载 ES / Kibana / Logstash，一条 compose 全拉起 | — | 必须 |
+| **colima + lima** | macOS 上的 Docker 虚拟机（Docker Desktop 的替代品） | 在 Mac 上提供 docker daemon | — | 仅 macOS |
+| **Elasticsearch** | 基于 Lucene 的分布式搜索与分析引擎 | 日志的存储层与查询层，所有检索都打给它 | 9200 | 必须 |
+| **Kibana** | ES 的 Web 前端，自己不存数据 | 看日志、画图、写查询、配告警、接 LLM | 5601 | 强烈建议 |
+| **Logstash** | 采集与转换管道（input → filter → output） | 练「日志怎么从文件流进 ES」这条链路 | 5044 / 5000 | 可选 |
+| **Python 3 + requests** | 脚本语言，只依赖一个 HTTP 库 | 建索引、造数据、调 AI 出报告 | — | 必须 |
+| **LLM**（DeepSeek / Ollama） | 大模型推理端点 | 把结构化证据翻译成根因分析报告 | — | 可选 |
+
+数据怎么流：
+
+```
+gen_logs.py ──bulk 写入──▶  Elasticsearch :9200  ◀──搜索──  ai_analyze.py ──▶ LLM ──▶ reports/*.md
+                                ▲      │
+               Kibana :5601 ────┘      └──── Logstash :5044（可选，从 logs/*.log 采集）
+```
+
+**关键认知**：ES 是唯一存数据的地方，其余都是它的「输入管道」或「输出界面」。所以排查问题时，
+只要 ES 里的数据是对的，Kibana 图不对、AI 结论不对，都是上层的事。
+
+---
+
+### 1. Docker Engine —— 容器运行时
+
+**概念**：把应用连同依赖（JDK、配置、系统库）一起打包成镜像，运行时用命名空间隔离，做到「一次构建，处处运行」。
+
+**为什么这套 demo 必须用它**：ELK 三个组件都是 JVM 应用，手工安装要配 JDK、建 `elasticsearch` 系统用户、
+调 `vm.max_map_count`、改一堆 yml。用容器这些全都被镜像封装好了，`docker compose up -d` 一行搞定。
+**不是必须用 Docker，但不用它你会把 90% 时间花在环境上，而不是学 ELK。**
+
+| 系统 | 安装方式 |
+|---|---|
+| macOS | 不装 Docker Desktop，用 colima（见下一条，省 1GB+ 内存） |
+| Linux | `curl -fsSL https://get.docker.com \| sh` 然后 `sudo usermod -aG docker $USER` |
+| Windows | 装 WSL2 + Docker Desktop，项目放 WSL 文件系统里（放 Windows 盘会慢十倍） |
+
+验证：`docker version` 能看到 `Server:` 段（不只是 `Client:`），说明 daemon 通了。
+
+---
+
+### 2. colima + lima —— 仅 macOS 需要
+
+**概念**：macOS 内核跑不了 Linux 容器，必须开一台 Linux 虚拟机。**lima** 负责用 Apple Virtualization.framework
+起轻量 VM，**colima** 在它之上把 Docker 运行时、端口转发、socket 挂载都封装好，对外表现得像原生 docker。
+
+**作用**：提供 `docker` 命令背后的 daemon。相比 Docker Desktop，它没有 GUI 和 Kubernetes，
+空闲内存少 1GB 以上——对内存长期吃紧的机器很关键。
+
+```bash
+brew install colima docker docker-compose
+colima start --cpu 2 --memory 4 --disk 30    # 首次会下载 Ubuntu 镜像
+docker version                                # 出现 Server 段即成功
+colima status                                 # 看 VM 状态
+```
+
+日常习惯：**用完 `colima stop`**，这 4GB 会立刻还给系统；下次 `colima start` 约 60 秒。
+
+> 本机安装时踩过两个坑（brew 沙箱报错、GitHub 不通导致镜像下不来），
+> 手动二进制方案写在指南 **2.2 节**，重装时可直接照抄。
+
+---
+
+### 3. Elasticsearch —— 存储与查询核心
+
+**概念**：面向文档的搜索引擎。数据以 JSON 文档存入，字段被建倒排索引，所以能做「毫秒级全文检索 + 聚合统计」。
+它同时是个分布式系统（分片、副本、选主），但单节点也能跑，本 demo 就是单节点。
+
+**在本 demo 中**：所有日志都写进索引 `app-logs-*`。你后面写的 DSL 查询、ES|QL、Kibana 的每张图、
+`ai_analyze.py` 取证据，全部是在向它发请求。
+
+**安装**：不需要单独装，它就是 compose 的第一个服务。配置在 `docker-compose.yml` 里，几个关键项：
+
+| 配置 | 值 | 为什么 |
+|---|---|---|
+| `discovery.type` | `single-node` | 单节点，跳过集群选主 |
+| `xpack.security.enabled` | `false` | demo 免密；**生产绝对不能这样** |
+| `ES_JAVA_OPTS` | `-Xms1g -Xmx1g` | 堆固定 1GB，够 10 万条日志；调大很吃内存 |
+| `bootstrap.memory_lock` | `true` | 锁内存防止被换出，避免查询抖动 |
+
+```bash
+docker compose up -d elasticsearch
+curl -s localhost:9200 | head -5    # 返回 version.number = 8.15.0 就算起来了
+```
+
+**它实际吃多少内存**：1GB 堆 + 约 700MB 堆外开销 ≈ 1.6GB。这是全 demo 最占资源的部分。
+
+---
+
+### 4. Kibana —— 可视化前端
+
+**概念**：跑在 Node.js 上的 Web 应用，通过 HTTP 调 ES 的 API 取数，**自身不存储任何日志**。
+它的价值在于把「写查询」变成「点鼠标」，把「结果」变成「图」。
+
+**在本 demo 中四个用途**（对应第 3、4 步）：
+
+| 功能 | 用途 |
+|---|---|
+| **Discover** | 逐条看原始日志，加过滤器缩小范围——排障第一步 |
+| **Dashboard** | 四张图搭出最小监控面板：日志量趋势 / 错误数 / p95 / status 分布 |
+| **Dev Tools** | 交互式写 DSL 和 ES\|QL，比用 curl 试错效率高得多 |
+| **Rules** | 配阈值告警（如 5 分钟内 ERROR > 50 条） |
+
+**安装**：同样是 compose 服务，`depends_on: condition: service_healthy` 保证它等 ES 健康后才启动
+（去掉这行它会因为连不上 ES 而反复重启）。
+
+```bash
+docker compose up -d kibana
+open http://localhost:5601        # 首次加载约 30~60s，别急着刷新
+```
+
+**它实际吃多少内存**：约 600MB。内存紧张时可以只开 ES，Kibana 那步用 curl 代替。
+
+---
+
+### 5. Logstash —— 采集管道（可选）
+
+**概念**：典型的三段式管道 `input → filter → output`。input 收数据（文件、beats、TCP、Kafka），
+filter 做解析改写（grok、date、mutate），output 发出去（ES、Kafka、S3）。
+
+**在本 demo 中**：它是可选件，用来练「日志如何从服务器文件流进 ES」这条真实链路。
+生产里常见形态是 `Filebeat（轻量采集）→ Logstash（重加工）→ ES`。
+
+**不用它的代价 / 用它的代价**：不用它也能拿数据（`gen_logs.py` 直接 bulk 写），但你会缺失对采集层的理解；
+用它则要多付约 500MB 内存（JVM 应用，堆给了 256m；此数字为按堆推算的估计值，本机未实测）。
+
+```bash
+mkdir -p logs                      # 先建目录，compose 挂载它，不存在会报错
+echo '{"@timestamp":"2026-11-26T10:00:00Z","service":"order-service","level":"ERROR","status":500,"latency_ms":2100,"message":"pool exhausted"}' > logs/app.log
+docker compose --profile collect up -d logstash   # 带了 profile；不加 --profile 它完全不启动
+docker compose logs -f logstash                    # 看 pipeline 是否加载成功
+```
+
+**观察重点**：同一份日志走 Logstash 和直接 bulk 写，进 ES 后的字段是有差别的——多出 `tags`、`env` 之类的加工字段，
+`@metadata` 会被丢掉。这个对比是理解采集层最直观的方式。
+
+> ⚠️ 这一步是**唯一没能本机实测**的环节：本机 VM 的 docker 代理端口失效，Logstash 镜像拉不下来
+> （ES / Kibana 镜像是代理还活着时拉的，所以能用）。命令和 `logstash/pipeline/demo.conf` 已核对过语法，
+> 但你第一次跑时如果卡在拉镜像，先看文末「关于 colima 里的代理」。
+
+---
+
+### 6. Python 脚本层
+
+**作用**：三个脚本构成 demo 的「操作台」，全部只依赖 `requests` 一个库，不需要装 ES 客户端 SDK。
+
+| 脚本 | 干什么 |
+|---|---|
+| `setup_es.py` | 建索引模板（定义字段类型）、ILM 策略、Kibana Data View |
+| `gen_logs.py` | 造 90 分钟日志灌进 ES，内含 2 个埋好的故障 |
+| `ai_analyze.py` | 从 ES 取证据 → 调 LLM → 输出 RCA 报告 |
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate   # 建议，避免污染系统环境
+python3 -m pip install -r requirements.txt
+python3 setup_es.py
+```
+
+> 版本要求宽松：Python 3.8+ 即可（本机实测 3.13），代码只用标准库 + `requests`，没用到任何新语法。
+
+---
+
+### 7. LLM —— 让 AI 层跑起来（可选）
+
+**作用**：把「错误率 + p95 + 堆栈采样」这些结构化证据，翻译成有人能读懂、能拿去验证的根因假设。
+它**不负责查数据**——查数据是 ES 的事，这个分工别搞混，搞混了就会写出「让模型猜日志」的无效 prompt。
+
+三种接入方式，任选其一：
+
+| 方式 | 成本 | 安装步骤 |
+|---|---|---|
+| 云端 API（DeepSeek / 通义） | 按量付费，几毛钱 | `.env` 填 `LLM_API_KEY` 即可，无需安装 |
+| 本地 Ollama | 免费，数据不出门 | `brew install ollama` → `ollama serve` → `ollama pull qwen2.5:7b` |
+| Elastic Playground | 用 Elastic 托管模型 | 在 Kibana 里连 connector，不用装 |
+
+```bash
+cp .env.example .env
+# 编辑 .env，三行任选一组：
+#   DeepSeek: LLM_BASE_URL=https://api.deepseek.com/v1  LLM_MODEL=deepseek-chat  LLM_API_KEY=sk-xxx
+#   Ollama:   LLM_BASE_URL=http://localhost:11434/v1    LLM_MODEL=qwen2.5:7b     LLM_API_KEY=ollama
+python3 ai_analyze.py
+```
+
+**什么 key 都没有？** `python3 ai_analyze.py --offline` 跑规则版，同样能定位异常服务，
+只是结论是模板拼的而不是模型生成的。先用它验证整条链路通不通。
+
+---
+
+### 装完自检
+
+```bash
+colima status                          # macOS：VM 是否在跑
+docker compose ps                      # ES 和 Kibana 是否 healthy
+curl -s localhost:9200 | grep number   # ES 版本
+curl -s localhost:5601/api/status | head -c 80   # Kibana 状态
+python3 -c "import requests; print('py ok')"
+```
+
+四条都过，就可以进第 0 步选环境了。
+
+**资源账**（决定你机器扛不扛得住）：
+
+| 组件 | 空闲内存 | 来源 |
+|---|---|---|
+| ES | ~1.6GB（1GB 堆 + 堆外开销） | `docker stats` 实测 1.616GiB |
+| Kibana | ~580MB | `docker stats` 实测 583MiB |
+| Logstash | ~500MB（可选，默认不开） | 按 256m 堆推算，未实测 |
+| colima VM 上限 | 4GB | 启动参数 `--memory 4` |
+
+不开 Logstash 时合计约 2.2GB（实测 2.20GiB）。**机器紧张就只开 ES**：`docker compose up -d elasticsearch`。
 
 ---
 
@@ -130,7 +349,7 @@ python3 gen_logs.py --minutes 180 --rate 300   # 想练大数据量时
 
 Kibana → Dev Tools 里跑，这是 ELK 的核心手感：
 
-```json
+```
 GET app-logs-*/_search
 {
   "size": 0,
@@ -213,8 +432,9 @@ python3 ai_analyze.py
 ## 第 6 步 · 加采集链路（可选，学 Filebeat/Logstash）
 
 ```bash
+mkdir -p logs                      # 必须先建，compose 挂载 ./logs，不存在会报错
+echo '{"@timestamp":"2026-11-26T10:00:00Z","service":"order-service","level":"ERROR","status":500,"latency_ms":2100,"message":"pool exhausted"}' > logs/app.log
 docker compose --profile collect up -d logstash
-python3 -c "import json;print(json.dumps({'@timestamp':'2026-11-26T10:00:00Z','service':'order-service','level':'ERROR','status':500,'latency_ms':2100,'message':'pool exhausted'}))" > logs/app.log
 ```
 
 Logstash 会把 `logs/*.log` 读进来，加 `env`、`http_5xx` 标签再写 ES。
@@ -231,6 +451,35 @@ Logstash 会把 `logs/*.log` 读进来，加 `env`、`http_5xx` 标签再写 ES�
 | bulk 报 `mapper_parsing_exception` | keyword 字段写了数字，或 `@timestamp` 格式不对（要 ISO8601 带 Z） |
 | 报告里"没发现明显异常" | 数据窗口过了 30 分钟就滑走了，重跑 `gen_logs.py` 再造一遍 |
 | Mac 风扇狂转 / 系统卡 | ES 堆降到 `-Xms512m`，或直接走 Elastic Cloud 路线 |
+| 拉镜像报 `proxyconnect tcp: dial tcp 192.168.x.x:PORT: connection refused` | colima VM 里 `daemon.json` 的 `proxies` 指向了已失效的代理端口（代理软件重启后端口会变）。见下方单独说明 |
+| `logs/` 不存在导致第 6 步报错 | 先 `mkdir -p logs` 再起 Logstash，compose 要挂载这个目录 |
+
+### 关于 colima 里的代理（踩过）
+
+VM 里的 docker daemon 会从宿主环境继承 `HTTP_PROXY`，把宿主端口「翻译」成 VM 网段地址后写进
+`/etc/docker/daemon.json`：
+
+```json
+{ "proxies": { "http-proxy": "http://192.168.5.2:54434", "https-proxy": "..." } }
+```
+
+宿主的代理软件一旦重启换了端口，这个写死的值就失效，表现为**任何镜像都拉不下来**。
+两种修法：
+
+```bash
+# 1) 让 colima 重新继承当前宿主代理（最快）
+colima stop && colima start
+
+# 2) 手动改端口，然后重启 daemon
+colima ssh -- sudo vi /etc/docker/daemon.json      # 把 54434 改成宿主当前代理端口
+colima ssh -- sudo systemctl restart docker
+```
+
+改完 `docker pull hello-world` 验证。注意重启 daemon 会让容器全部重启，
+`docker compose up -d` 拉回来即可，数据在卷里不会丢。
+
+> 另一种情况：代理只监听宿主的 `127.0.0.1`（某些客户端就是这样），VM 无论如何都访问不到。
+> 这时 `--noproxy` 直连也未必通，最省事的办法是**改用 Elastic Cloud 路线**，别跟本地网络死磕。
 
 ---
 
